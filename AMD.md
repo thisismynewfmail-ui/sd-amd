@@ -219,11 +219,12 @@ Install HIP SDK 6.2 or 6.4, or set `HIP_PATH` to an existing install.
 Usually a HIP SDK version mismatch (7.x is not supported), or a card whose
 `rocBLAS` libraries are missing from the SDK.
 
-**"RuntimeError: operator torchvision::nms does not exist"**
-torchvision's compiled extension (`_C.pyd`) failed to load, almost always
-because it was built against a different PyTorch than the one installed.
-torchvision hides that load error and only fails later, on the first missing
-operator, which is why the traceback points at `_meta_registrations.py`.
+**"RuntimeError: operator torchvision::nms does not exist"**, or a
+**"python.exe - Entry Point Not Found"** dialog naming `torchvision\_C.pyd`
+torchvision's compiled extension failed to load, almost always because it was
+built against a different PyTorch than the one installed. torchvision hides that
+load error and only fails later, on the first missing operator, which is why the
+traceback points at `_meta_registrations.py`.
 
 The launcher now checks for this on startup and reinstalls a matching build by
 itself. If you hit it in an environment you manage by hand, install the

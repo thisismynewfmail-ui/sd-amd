@@ -498,12 +498,46 @@ Re-run with --reinstall-torch to fix.
 #: `import torchvision` only *warns* when its compiled extension fails to load
 #: (and only when this is set), then dies much later on a missing operator.
 TORCHVISION_PROBE: Final[str] = """
-import os
+import ctypes, os
+if os.name == "nt":
+    # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX. Loading a torchvision
+    # built against a different torch makes the Windows loader pop a modal
+    # "Entry Point Not Found" box, which would sit there waiting for a click
+    # while the launcher waits for this process to exit. (torch does the same
+    # thing around its own DLL loading, and restores whatever it found -- so
+    # this has to be set before torch is imported to survive that.)
+    ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
 os.environ["TORCHVISION_WARN_WHEN_EXTENSION_LOADING_FAILS"] = "1"
 import torch, torchvision
 assert torchvision.extension._has_ops(), "torchvision C++ extension did not load"
 torch.ops.torchvision.nms
 """
+
+
+def torchvision_pair_mismatch() -> str | None:
+    """
+    Explain why the installed torchvision cannot be the one for this torch.
+
+    Cheap and decisive: reading two version strings beats importing torch in a
+    subprocess, and it catches the common case *before* anything tries to load
+    the mismatched extension.
+    """
+
+    torch_version = _installed_version("torch")
+    vision_version = _installed_version("torchvision")
+
+    expected = torchvision_for_torch(torch_version)
+    if expected is None or "unknown" in (torch_version, vision_version):
+        return None  # nothing to compare against
+
+    def series(version: str) -> str:
+        return ".".join(version.partition("+")[0].split(".")[:2])
+
+    if series(vision_version) == series(expected):
+        return None
+
+    return (f"torchvision {vision_version.partition('+')[0]} is built against a different PyTorch than "
+            f"torch {torch_version.partition('+')[0]} (which pairs with torchvision {expected})")
 
 
 def _installed_version(package: str) -> str:
@@ -560,12 +594,15 @@ def repair_torchvision(backend: str):
     except OSError:
         pass
 
-    working, detail = torchvision_ops_load()
-    if working:
-        _write_receipt(receipt, pair)
-        return
+    detail = torchvision_pair_mismatch()
+    if detail is None:
+        # The versions pair up, so the only way left to tell is to try it.
+        working, detail = torchvision_ops_load()
+        if working:
+            _write_receipt(receipt, pair)
+            return
 
-    print("torchvision cannot load its compiled ops (ABI mismatch with the installed PyTorch); repairing...")
+    print(f"Replacing torchvision: {detail.strip().splitlines()[0]}")
 
     stamp = _local_version("torch")
     candidates: list[str] = []
@@ -605,7 +642,30 @@ then re-launch with --reinstall-torch. See AMD.md.
 {detail}""")
 
 
+def suppress_windows_error_dialogs():
+    """
+    Stop the Windows loader from popping modal boxes at us.
+
+    A DLL that fails to resolve an import gets an "Entry Point Not Found" dialog
+    that blocks until someone clicks OK -- fatal for an unattended launcher, and
+    useless to the user since the same failure is about to be reported properly.
+    Child processes inherit this, so every probe and pip run is covered too.
+    """
+
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)  # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+    except Exception:
+        pass
+
+
 def prepare_environment():
+    suppress_windows_error_dialogs()
+
     backend = resolve_gpu_backend()
 
     torch_index_url = os.environ.get("TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu130")

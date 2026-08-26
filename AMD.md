@@ -188,6 +188,18 @@ weights in a compact format and casting them per-layer as they are used:
 * **fp8 (`e4m3fn` / `e5m2`)** checkpoints — the weights stay fp8 in memory and
   are cast to fp16 for the matmul. RDNA 2 has no fp8 hardware, so `--fast-fp8`
   has no effect and is ignored.
+* **INT8** checkpoints (`...Int8.safetensors`, and INT8 Krea 2 in particular) —
+  supported, and the memory saving is real, but the matmul is not accelerated
+  on RDNA 2. hipBLASLt ships no INT8 GEMM kernel for `gfx103X`, and calling the
+  one PyTorch exposes crashes the process outright, so startup detects that and
+  substitutes an fp32 matmul:
+
+  ```
+  INT8 matmul: using the fp32 fallback (this GPU's ROCm libraries have no INT8 GEMM kernel)
+  ```
+
+  Expect roughly fp16 speed with int8 memory use. A GGUF or fp8 build of the
+  same model will generally be faster.
 * Anything that still does not fit is offloaded to system RAM, which is what
   `--pin-shared-memory` accelerates.
 
@@ -200,6 +212,8 @@ continues, rather than failing the install:
 
 `--xformers` · `--sage` · `--flash` · `--nunchaku` · `--onnxruntime-gpu` ·
 `--cuda-malloc` · `--fast-fp8` (on RDNA 2)
+
+INT8 checkpoints load and run, but without an INT8 speedup — see above.
 
 ---
 
@@ -249,6 +263,12 @@ then relaunch with `--reinstall-torch`. To see the underlying load error, set
 **The warning about a mismatched PyTorch build**
 Something replaced PyTorch — usually an extension's `install.py`, or a manual
 `pip install -r requirements.txt`. Relaunch with `--reinstall-torch`.
+
+**A 0xC0000005 crash dump mentioning `_int_mm` or `torch_hip.dll`**
+An INT8 checkpoint reached an INT8 matmul kernel that does not exist for your
+GPU. This is detected automatically on the first launch after the venv is built;
+if you are seeing it, delete `tmp\int-mm-*.ok` and relaunch so the check runs
+again.
 
 **Out of memory during hires-fix**
 Drop `--use-pytorch-cross-attention` if you added it, add `--reserve-vram 1.0`,

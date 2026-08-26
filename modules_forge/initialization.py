@@ -115,6 +115,12 @@ def initialize_forge():
 
     verify_compute_device(backend, torch)
 
+    if backend in gpu_backend.Backend.AMD:
+        from modules_forge.int_mm_fallback import install_int_mm_fallback
+
+        if install_int_mm_fallback(torch):
+            print("INT8 matmul: using the fp32 fallback (this GPU's ROCm libraries have no INT8 GEMM kernel)")
+
     from backend import memory_management
 
     startup_timer.record("memory_management")

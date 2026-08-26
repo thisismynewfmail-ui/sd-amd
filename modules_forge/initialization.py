@@ -6,6 +6,47 @@ from modules.timer import startup_timer
 INITIALIZED = False
 
 
+def verify_compute_device(backend: str, torch):
+    """
+    Fail with an explanation rather than an assert from deep inside torch.
+
+    `torch.cuda` covers ROCm and ZLUDA too -- both present themselves through
+    the CUDA API surface.
+    """
+
+    from modules_forge.gpu_backend import Backend
+
+    if backend in (Backend.CPU, Backend.DIRECTML):
+        return
+
+    if torch.cuda.is_available():
+        return
+
+    build = getattr(torch.version, "hip", None) or getattr(torch.version, "cuda", None) or "cpu-only"
+
+    hints = [f"The '{backend}' backend was selected, but this PyTorch ({torch.__version__}, {build}) cannot reach a GPU."]
+
+    try:
+        import importlib.metadata
+
+        recorded = importlib.metadata.version("torch")
+    except Exception:
+        recorded = None
+
+    if recorded is not None and recorded != torch.__version__:
+        hints.append(f"  * pip records torch {recorded} but {torch.__version__} was imported: the install is half-replaced.")
+        hints.append("    Delete any '~*' folders in site-packages, then re-run with --reinstall-torch.")
+    elif build == "cpu-only":
+        hints.append("  * this is a CPU-only build; re-run with --reinstall-torch.")
+    elif backend == Backend.ROCM:
+        hints.append("  * update the AMD Adrenalin driver, then re-run.")
+        hints.append("  * or fall back to ZLUDA with --gpu-backend zluda")
+
+    hints.append("  * use --cpu to run without a GPU (slow)")
+
+    raise RuntimeError("\n".join(hints))
+
+
 def initialize_forge():
     global INITIALIZED
     if INITIALIZED:
@@ -68,11 +109,16 @@ def initialize_forge():
         try_expandable_segments()
         startup_timer.record("expandable_segments")
 
+    # First import of torch in this process: everything above has to have
+    # finished setting environment variables by now.
+    import torch
+
+    verify_compute_device(backend, torch)
+
     from backend import memory_management
 
     startup_timer.record("memory_management")
 
-    import torch
     import torchvision  # noqa: F401
 
     startup_timer.record("import torch")

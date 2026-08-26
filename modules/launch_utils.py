@@ -494,6 +494,12 @@ def prepare_environment():
             torch_command = os.environ.get("TORCH_COMMAND", f"pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 --extra-index-url {torch_index_url}")
             print("(using an older version of PyTorch due to Nunchaku dependency...)")
 
+        if "torch" in sys.modules:
+            # Replacing PyTorch underneath a process that already imported it
+            # leaves the stale module in sys.modules -- and on Windows holds its
+            # DLLs open, so pip cannot even remove the old files.
+            raise RuntimeError("PyTorch was imported before the installer could replace it; this is a bug. Re-run with --skip-prepare-environment after installing PyTorch by hand.")
+
         run(f'"{python}" -m {torch_command}', "Installing PyTorch", "Couldn't install PyTorch", live=True)
         startup_timer.record("install torch")
 

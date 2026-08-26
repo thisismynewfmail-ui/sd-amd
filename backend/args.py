@@ -63,6 +63,7 @@ parser.add_argument("--cpu-text-enc", action="store_true", help="Run the text en
 parser.add_argument("--use-pytorch-cross-attention", action="store_true", help="Use the PyTorch cross attention (override sageattention/flash_attn/xformers)")
 parser.add_argument("--force-xformers-vae", action="store_true", help="Force VAE to use xformers attention (meant to be used with --use-pytorch-cross-attention)")
 parser.add_argument("--force-upcast-attention", action="store_true", help="Always upcast to fp32 during attention")
+parser.add_argument("--no-upcast-attention", action="store_true", help="Never upcast attention, even where fp16 is known to overflow")
 
 parser.add_argument("--sage", action="store_true", help="install sageattention")
 parser.add_argument("--flash", action="store_true", help="install flash_attn")

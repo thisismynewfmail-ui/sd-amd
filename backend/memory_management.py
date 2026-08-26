@@ -29,6 +29,7 @@ import time
 import weakref
 from contextlib import nullcontext
 from enum import Enum
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import psutil
@@ -908,6 +909,20 @@ def unet_dtype(device: torch.device = None, model_params: int = 0, supported_dty
 
 
 def inference_cast(weight_dtype: torch.dtype, inference_device: torch.device, supported_dtypes: list[torch.dtype] = [torch.float16, torch.bfloat16, torch.float32]) -> torch.dtype:
+    # `unet_dtype` honours these overrides for *storage*; without the same
+    # block here they never reached computation. On RDNA 2 that made
+    # --bf16-unet a no-op -- `should_use_bf16` reports False for the card (a
+    # speed preference: bf16 has no matrix hardware there) so the search below
+    # settled on fp16 again, which is the precision the user was trying to
+    # escape. An explicit request is about correctness and outranks the
+    # preference.
+    if args.fp32_unet:
+        return torch.float32
+    if args.bf16_unet and supports_dtype(inference_device, torch.bfloat16):
+        return torch.bfloat16
+    if args.fp16_unet:
+        return torch.float16
+
     if weight_dtype == torch.float32:
         return weight_dtype
 
@@ -1163,11 +1178,22 @@ def pytorch_attention_flash_attention() -> bool:
     return False
 
 
+@lru_cache
 def force_upcast_attention_dtype() -> dict[torch.dtype, torch.dtype]:
     upcast: bool = args.force_upcast_attention
 
     macos_version = mac_version()
     if macos_version is not None and macos_version >= (14, 5):
+        upcast = True
+
+    if not upcast and not args.no_upcast_attention and is_amd() and not should_use_bf16():
+        # RDNA 2 and older have no bf16 path, so bf16-native models (Flux,
+        # Krea 2, Qwen-Image, Wan) get run in fp16 instead. Their attention
+        # logits routinely exceed fp16's 65504, and the inf that follows turns
+        # the whole softmax into NaN -- which the pipeline zeroes out, i.e. a
+        # black image. Only the scores and the softmax are upcast; the weights
+        # and the value matmul stay fp16.
+        logger.info("Upcasting attention to fp32: this GPU has no bf16, and fp16 attention overflows on bf16-native models (--no-upcast-attention to disable)")
         upcast = True
 
     return {torch.float16: torch.float32} if upcast else {}

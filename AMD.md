@@ -160,13 +160,25 @@ Other options worth knowing:
 
 ### Precision on RDNA 2
 
-RDNA 2 has no bf16 matrix hardware, so weights are stored and computed in
-**fp16** by default even for models that ship as bf16 (Flux, Krea 2, Qwen-Image,
-Wan). This is the right trade — bf16 on `gfx1030` is emulated and several times
-slower.
+RDNA 2 has no bf16 matrix hardware, so weights are computed in **fp16** by
+default even for models that ship as bf16 (Flux, Krea 2, Qwen-Image, Wan). This
+is the right trade on speed — bf16 on `gfx1030` is emulated and several times
+slower — but fp16 tops out at 65504, and these models produce attention scores
+well past that. The overflow becomes `inf`, the softmax becomes `NaN`, and the
+pipeline zeroes it: a black image.
 
-If a specific model produces black or corrupted images in fp16, pass
-`--bf16-unet` for it. It will be slow but numerically faithful.
+So on a card with no bf16, attention scores and the softmax are computed in fp32
+by default. The rest of the model stays fp16, and the cost is small next to
+running everything in bf16. You will see:
+
+```
+Upcasting attention to fp32: this GPU has no bf16, and fp16 attention overflows on bf16-native models
+```
+
+`--no-upcast-attention` turns it off if you would rather have the speed.
+
+If a model still comes out black or corrupted, `--bf16-unet` runs it in its
+native bf16 throughout — slow, but numerically faithful.
 
 ### Attention
 
@@ -269,6 +281,16 @@ An INT8 checkpoint reached an INT8 matmul kernel that does not exist for your
 GPU. This is detected automatically on the first launch after the venv is built;
 if you are seeing it, delete `tmp\int-mm-*.ok` and relaunch so the check runs
 again.
+
+**A black image**
+The log names the stage that went NaN and what to try — the diffusion model and
+the VAE are separate problems with separate fixes:
+
+```
+NaN in the output: the diffusion model produced NaN, ... Worth trying:
+  * --bf16-unet          run the model in its native bf16 (slower, numerically faithful)
+  ...
+```
 
 **Out of memory during hires-fix**
 Drop `--use-pytorch-cross-attention` if you added it, add `--reserve-vram 1.0`,

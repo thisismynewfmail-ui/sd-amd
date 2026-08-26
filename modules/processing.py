@@ -609,9 +609,46 @@ class DecodedSamples(list):
     already_decoded = True
 
 
+#: Advice per stage, for when a generation goes NaN. Which stage it was narrows
+#: the fix down a long way, and the alternative is a black image and a guess.
+NAN_ADVICE = {
+    "sampling": (
+        "the diffusion model produced NaN, so nothing downstream can recover the image",
+        (
+            "  * --bf16-unet          run the model in its native bf16 (slower, numerically faithful)",
+            "  * --force-upcast-attention  compute attention scores in fp32",
+            "  * a GGUF or fp8 build of the same model",
+        ),
+    ),
+    "vae": (
+        "the diffusion model was fine, but the VAE produced NaN while decoding it",
+        (
+            "  * --fp32-vae           decode in full precision",
+            "  * a different VAE for this checkpoint",
+        ),
+    ),
+}
+
+
+def report_nan(stage: str):
+    what, fixes = NAN_ADVICE[stage]
+    logger.warning("\n".join((f"NaN in the output: {what}. Worth trying:", *fixes)))
+
+
 def decode_latent_batch(model, batch, target_device=None, check_for_nans=False):
+    # `check_for_nans` was accepted and then ignored, so a NaN was only noticed
+    # after the decode, by which point there is no way to tell whether the
+    # sampler or the VAE produced it -- two unrelated fixes, and a three-minute
+    # generation to test each guess.
+    if check_for_nans and torch.isnan(batch).any():
+        report_nan("sampling")
+        check_for_nans = False  # the decode is going to be NaN too; don't blame the VAE
+
     samples = DecodedSamples()
     samples_pytorch = decode_first_stage(model, batch).to(target_device)
+
+    if check_for_nans and torch.isnan(samples_pytorch).any():
+        report_nan("vae")
 
     for x in samples_pytorch:
         samples.append(x)

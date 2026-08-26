@@ -21,7 +21,10 @@ class KModel(torch.nn.Module):
         if args.dynamic_args.ops.endswith("FP8"):
             _compute += f" + {torch.float8_e4m3fn}"
         if args.dynamic_args.ops.startswith("Mixed"):
-            _compute = "computation: Mixed"
+            # Still name the float dtype: "Mixed" alone hides whether the
+            # unquantised layers are running in fp16 or bf16, which is exactly
+            # what you need to know when the output comes out black.
+            _compute = f"computation: Mixed ({self.computation_dtype})"
 
         memory_management.logger.info(f"Diffusion Model: {{{_store}, {_compute}}}")
 

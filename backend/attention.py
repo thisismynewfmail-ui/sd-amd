@@ -97,7 +97,12 @@ if memory_management.ck_enabled():
 
 
 def get_attn_precision(attn_precision: torch.dtype, current_dtype: torch.dtype) -> torch.dtype:
-    memory_management.force_upcast_attention_dtype().get(current_dtype, attn_precision)
+    # The `return` was missing, so this handed back None however it was called:
+    # every attention implementation took its non-upcasting branch and
+    # --force-upcast-attention did nothing at all. It goes unnoticed on NVIDIA,
+    # where bf16 is available and nothing needs upcasting; on a card forced onto
+    # fp16 it is the difference between an image and a black frame.
+    return memory_management.force_upcast_attention_dtype().get(current_dtype, attn_precision)
 
 
 def exists(val) -> bool:

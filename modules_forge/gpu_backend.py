@@ -319,48 +319,90 @@ def rocm_index_url(arch: str | None = None) -> str | None:
 # region Selection
 
 
-def installed_backend() -> str | None:
-    """Backend implied by the PyTorch build that is currently installed."""
+@functools.cache
+def torch_version_info():
+    """
+    Read `torch/version.py` *without* importing torch.
+
+    This module runs before PyTorch is installed, and -- more importantly --
+    before the installer may replace it. Importing torch here would pin the
+    outgoing build in `sys.modules` (and hold its DLLs open, so pip cannot
+    remove them), leaving the rest of the process using a PyTorch that no
+    longer exists on disk.
+    """
+
+    import importlib.util
 
     try:
-        import torch
+        spec = importlib.util.find_spec("torch")
     except Exception:
         return None
 
-    if getattr(torch.version, "hip", None):
-        return Backend.ROCM
+    if spec is None or not spec.submodule_search_locations:
+        return None
+
+    for folder in spec.submodule_search_locations:
+        path = os.path.join(folder, "version.py")
+        if not os.path.isfile(path):
+            continue
+        try:
+            probe = importlib.util.spec_from_file_location("torch_version_probe", path)
+            module = importlib.util.module_from_spec(probe)
+            probe.loader.exec_module(module)
+        except Exception:
+            return None
+        else:
+            return module
+
+    return None
+
+
+def _module_installed(name: str) -> bool:
+    """Whether `name` is importable, without executing it."""
+
+    import importlib.util
 
     try:
-        import torch_directml  # noqa: F401
+        return importlib.util.find_spec(name) is not None
     except Exception:
-        pass
-    else:
-        if os.environ.get("SD_GPU_BACKEND") == Backend.DIRECTML:
-            return Backend.DIRECTML
+        return False
 
-    if getattr(torch.version, "cuda", None):
+
+def installed_backend() -> str | None:
+    """Backend implied by the PyTorch build that is currently installed."""
+
+    version = torch_version_info()
+    if version is None:
+        return None
+
+    if getattr(version, "hip", None):
+        return Backend.ROCM
+
+    if getattr(version, "cuda", None):
         return Backend.ZLUDA if is_zluda_runtime() else Backend.CUDA
+
+    if _module_installed("torch_directml"):
+        return Backend.DIRECTML
 
     return Backend.CPU
 
 
 def is_zluda_runtime() -> bool:
-    """True when the loaded CUDA runtime is actually ZLUDA."""
+    """
+    True when a CUDA build of PyTorch is going to be driven by ZLUDA.
+
+    Determined without importing torch: the loaded runtime cannot be inspected
+    until ZLUDA has been bound, which happens much later in startup.
+    """
 
     if os.environ.get("SD_ZLUDA_ACTIVE") == "1":
         return True
 
-    try:
-        import torch
-    except Exception:
-        return False
+    if os.environ.get("SD_GPU_BACKEND") == Backend.ZLUDA:
+        return True
 
-    try:
-        name = torch.cuda.get_device_name(torch.cuda.current_device())
-    except Exception:
-        return False
-
-    return "[ZLUDA]" in name
+    # A ZLUDA install next to an AMD-only machine is unambiguous.
+    return os.path.isfile(os.path.join(os.path.abspath(os.environ.get("ZLUDA", ".zluda")), "nvcuda.dll")) and has_amd_gpu() and not has_nvidia_gpu()
 
 
 def select_backend(requested: str | None = None) -> str:

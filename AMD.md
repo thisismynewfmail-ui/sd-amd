@@ -219,6 +219,32 @@ Install HIP SDK 6.2 or 6.4, or set `HIP_PATH` to an existing install.
 Usually a HIP SDK version mismatch (7.x is not supported), or a card whose
 `rocBLAS` libraries are missing from the SDK.
 
+**"RuntimeError: operator torchvision::nms does not exist"**
+torchvision's compiled extension (`_C.pyd`) failed to load, almost always
+because it was built against a different PyTorch than the one installed.
+torchvision hides that load error and only fails later, on the first missing
+operator, which is why the traceback points at `_meta_registrations.py`.
+
+The launcher now checks for this on startup and reinstalls a matching build by
+itself. If you hit it in an environment you manage by hand, install the
+torchvision that pairs with your torch — AMD's nightly channel publishes several
+under the same date stamp, and the newest is *not* the matching one:
+
+| torch | torchvision |
+|---|---|
+| 2.9 | 0.24.0 |
+| 2.10 | 0.25.0 |
+| 2.11 | 0.26.0 |
+| 2.12 | 0.27.0a0 |
+
+```bat
+set TORCH_VERSION=2.9.1+rocm7.13.0a20260421
+set TORCHVISION_VERSION=0.24.0+rocm7.13.0a20260421
+```
+
+then relaunch with `--reinstall-torch`. To see the underlying load error, set
+`TORCHVISION_WARN_WHEN_EXTENSION_LOADING_FAILS=1`.
+
 **The warning about a mismatched PyTorch build**
 Something replaced PyTorch — usually an extension's `install.py`, or a manual
 `pip install -r requirements.txt`. Relaunch with `--reinstall-torch`.

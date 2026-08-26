@@ -250,13 +250,59 @@ OOM_EXCEPTION = getattr(torch, "OutOfMemoryError", Exception)
 ACCELERATOR_ERROR = getattr(torch, "AcceleratorError", RuntimeError)
 
 
+#: Fragments of the errors a GPU raises once its context is gone -- a kernel
+#: fault, a driver timeout (TDR), or a reset. Nothing after one of these can
+#: succeed until the process restarts.
+DEVICE_LOST_ERRORS = (
+    "unspecified launch failure",
+    "launchfailure",
+    "an illegal memory access",
+    "illegaladdress",
+    "device-side assert",
+    "context is destroyed",
+    "invalid device context",
+    "uncorrectable ecc",
+)
+
+
+def is_device_lost(e: Exception) -> bool:
+    """Whether the GPU context died, as opposed to merely running out of room."""
+
+    message = str(e).lower().replace("hiperror", "").replace("cudaerror", "")
+    return any(fragment in message for fragment in DEVICE_LOST_ERRORS)
+
+
 def is_oom(e: Exception) -> bool:
     if isinstance(e, OOM_EXCEPTION):
         return True
+    # A dead context raises AcceleratorError just like an OOM does, and calling
+    # it OOM sends the caller into a "retry, but smaller" path that cannot
+    # possibly work -- the retry throws too, and so does the cleanup after it,
+    # so the real failure ends up buried under a page of unrelated tracebacks.
+    if is_device_lost(e):
+        return False
     if isinstance(e, ACCELERATOR_ERROR) or "out of memory" in str(e).lower():
         discard_cuda_async_error()
         return True
     return False
+
+
+def device_lost_message(e: Exception) -> str:
+    lines = [
+        f"The GPU stopped responding and its context was lost ({type(e).__name__}).",
+        "Everything after this point fails until the Web UI is restarted -- the tracebacks below are all fallout.",
+        "",
+        "On Windows this is usually the driver's timeout detection (TDR) resetting a card that spent",
+        "too long inside one kernel. Worth trying:",
+        "  * generate at a lower resolution, or enable tiled VAE decoding",
+        "  * update the AMD Adrenalin driver",
+        "  * raise the TDR delay (see AMD.md)",
+    ]
+
+    if is_amd() and torch.backends.cudnn.enabled:
+        lines.append("  * ENABLE_MIOPEN=0 to keep convolutions off MIOpen")
+
+    return "\n".join(lines)
 
 
 if args.disable_xformers:
@@ -343,9 +389,19 @@ if is_amd():
         arch = amd_arch(get_torch_device())
         is_rdna2_or_older = any((a in arch) for a in AMD_RDNA2_AND_OLDER_ARCH)
 
-        if not is_rdna2_or_older:
-            if os.getenv("ENABLE_MIOPEN") != "1":
-                torch.backends.cudnn.enabled = False
+        # MIOpen's convolutions are opt-in on every AMD card here. Upstream
+        # turns them off for RDNA 3 and newer; on gfx1030 they are no better --
+        # MIOpen benchmarks candidate kernels at runtime (`EvaluateInvokers`),
+        # and on this arch a candidate can take the GPU down with it:
+        #
+        #   MIOpen(HIP): Warning [OpenRuntimeLibraryForDevice] CK grouped conv
+        #                library not found for device gfx1030
+        #   MIOpen(HIP): Error [EvaluateInvokers] ... unspecified launch failure
+        #
+        # which is an unrecoverable context loss mid-VAE-decode. PyTorch's own
+        # convolutions are not always as quick, but they do come back.
+        if os.getenv("ENABLE_MIOPEN") != "1":
+            torch.backends.cudnn.enabled = False
 
         try:
             rocm_version = tuple(map(int, str(torch.version.hip).split(".")[:2]))
@@ -1460,11 +1516,18 @@ def soft_empty_cache(force=False):
         torch.xpu.synchronize()
         torch.xpu.empty_cache()
     elif torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        if not is_zluda():
-            # CUDA IPC is not implemented by ZLUDA, and is a no-op on ROCm.
-            torch.cuda.ipc_collect()
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            if not is_zluda():
+                # CUDA IPC is not implemented by ZLUDA, and is a no-op on ROCm.
+                torch.cuda.ipc_collect()
+        except ACCELERATOR_ERROR:
+            # Freeing memory on a GPU whose context is gone cannot work, and
+            # this runs from cleanup paths -- raising here replaces the error
+            # that actually killed the generation with a confusing one from the
+            # tidy-up afterwards.
+            pass
 
     global signal_empty_cache
     signal_empty_cache = False

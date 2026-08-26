@@ -30,9 +30,12 @@ class Task:
             self.result = self.func(*self.args, **self.kwargs)
             last_exception = None
         except Exception as e:
-            from backend.memory_management import is_oom, logger
+            from backend.memory_management import device_lost_message, is_device_lost, is_oom, logger
 
-            if is_oom(e):
+            if is_device_lost(e):
+                logger.error(device_lost_message(e))
+                last_exception = "GPU context lost"
+            elif is_oom(e):
                 logger.error("Encountered Out of Memory during Sampling; Unloading all Models...")
                 last_exception = "OOM"
             else:

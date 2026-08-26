@@ -54,13 +54,22 @@ class MemUsageMonitor(threading.Thread):
                 self.run_flag.clear()
                 continue
 
-            self.data["min_free"] = self.cuda_mem_get_info()[0]
+            try:
+                self.data["min_free"] = self.cuda_mem_get_info()[0]
 
-            while self.run_flag.is_set():
-                free, total = self.cuda_mem_get_info()
-                self.data["min_free"] = min(self.data["min_free"], free)
+                while self.run_flag.is_set():
+                    free, total = self.cuda_mem_get_info()
+                    self.data["min_free"] = min(self.data["min_free"], free)
 
-                time.sleep(1 / self.opts.memmon_poll_rate)
+                    time.sleep(1 / self.opts.memmon_poll_rate)
+            except Exception as e:
+                # A lost GPU context makes every query throw. This is a monitor
+                # thread: dying here buries the real failure under a traceback
+                # for a thread nobody was asking about.
+                memory_management.logger.warning(f"Memory Monitor Disabled: {e}")
+                self.disabled = True
+                self.run_flag.clear()
+                return
 
     def dump_debug(self):
         print(self, "recorded data:")

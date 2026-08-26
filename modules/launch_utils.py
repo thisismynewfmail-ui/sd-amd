@@ -302,7 +302,50 @@ def requirements_met(requirements_file):
 #: so the whole trio has to move together -- hence the pin.
 ROCM_LINUX_CHANNEL: Final[str] = os.environ.get("ROCM_CHANNEL", "rocm7.1")
 TORCH_ROCM_VERSION: Final[str] = "2.9.1+rocm7.13.0a20260421"
-TORCHVISION_ROCM_VERSION: Final[str] = "0.27.0a0+rocm7.13.0a20260421"
+
+#: torch release -> the torchvision release built against its C++ ABI.
+#:
+#: TheRock publishes *several* torchvision builds under one nightly stamp
+#: (0.24.0, 0.25.0, 0.26.0, 0.27.0a0 all exist for 2026-04-21), and only one of
+#: them links against the `torch` of that same stamp. Picking the newest is the
+#: trap: `torchvision-0.27.0a0` is compiled against torch 2.10's `c10.dll`, so on
+#: torch 2.9.1 `_C.pyd` fails to resolve 25 symbols. torchvision swallows that
+#: load error, and the import blows up further down with the very unhelpful
+#:
+#:     RuntimeError: operator torchvision::nms does not exist
+#:
+#: This is the upstream pairing from https://github.com/pytorch/vision#installation.
+TORCHVISION_FOR_TORCH: Final[dict[str, str]] = {
+    "2.9": "0.24.0",
+    "2.10": "0.25.0",
+    "2.11": "0.26.0",
+    "2.12": "0.27.0a0",
+    "2.13": "0.28.0",
+}
+
+#: Tried in turn by `repair_torchvision()` when the paired build still does not
+#: load -- the channel occasionally shifts which torch a given stamp carries.
+TORCHVISION_ROCM_CANDIDATES: Final[tuple[str, ...]] = ("0.24.0", "0.25.0", "0.26.0", "0.27.0a0")
+
+
+def torchvision_for_torch(torch_version: str) -> str | None:
+    """`"2.9.1+rocm7.13.0a20260421"` -> `"0.24.0"`."""
+
+    release = torch_version.partition("+")[0]
+    return TORCHVISION_FOR_TORCH.get(".".join(release.split(".")[:2]))
+
+
+def rocm_torchvision_pin(torch_pin: str) -> str:
+    """The torchvision to install alongside `torch_pin`, same nightly stamp."""
+
+    explicit = os.environ.get("TORCHVISION_VERSION")
+    if explicit:
+        return explicit
+
+    stamp = torch_pin.partition("+")[2]
+    version = torchvision_for_torch(torch_pin) or TORCHVISION_ROCM_CANDIDATES[0]
+    return f"{version}+{stamp}" if stamp else version
+
 
 #: ZLUDA translates the CUDA driver API, and only implements CUDA 11.x, so the
 #: cu118 build of PyTorch is the one to use.
@@ -338,7 +381,7 @@ def torch_install_command(backend: str) -> str:
 Run with --gpu-backend zluda instead (requires the AMD HIP SDK 6.2/6.4), or
 set ROCM_INDEX_URL to a wheel index that covers your card.""")
         torch_pin = os.environ.get("TORCH_VERSION", TORCH_ROCM_VERSION)
-        vision_pin = os.environ.get("TORCHVISION_VERSION", TORCHVISION_ROCM_VERSION)
+        vision_pin = rocm_torchvision_pin(torch_pin)
         # Every transitive dependency (including the rocm-sdk runtime packages)
         # is served by the same index, so it is used as the *primary* one.
         return f"pip install --pre torch=={torch_pin} torchvision=={vision_pin} --index-url {index}"
@@ -452,6 +495,116 @@ Re-run with --reinstall-torch to fix.
 """)
 
 
+#: `import torchvision` only *warns* when its compiled extension fails to load
+#: (and only when this is set), then dies much later on a missing operator.
+TORCHVISION_PROBE: Final[str] = """
+import os
+os.environ["TORCHVISION_WARN_WHEN_EXTENSION_LOADING_FAILS"] = "1"
+import torch, torchvision
+assert torchvision.extension._has_ops(), "torchvision C++ extension did not load"
+torch.ops.torchvision.nms
+"""
+
+
+def _installed_version(package: str) -> str:
+    try:
+        importlib.invalidate_caches()
+        return importlib.metadata.version(package)
+    except Exception:
+        return "unknown"
+
+
+def _write_receipt(path: str, contents: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(contents)
+    except OSError:
+        pass
+
+
+def torchvision_ops_load() -> tuple[bool, str]:
+    """Whether torchvision's compiled ops are usable, plus the failure output."""
+
+    success, err = check_run_python(TORCHVISION_PROBE, return_error=True)
+    if success:
+        return True, ""
+    return False, err.decode("utf-8", "ignore") if isinstance(err, bytes) else str(err)
+
+
+def repair_torchvision(backend: str):
+    """
+    Make sure the installed torchvision can actually load its C++ extension.
+
+    A torchvision whose ABI does not match the installed torch looks perfectly
+    healthy to every check we can make from metadata -- right version, right
+    `+rocm` local label, imports without an exception in `pip` -- and only fails
+    when the first op is looked up, long after startup has printed its banner.
+    So it is verified by actually importing it, and repaired by walking the
+    builds the wheel index offers for the installed torch.
+    """
+
+    if not is_installed("torchvision"):
+        # DirectML is the one backend that runs without it.
+        return
+
+    # Importing torch in a subprocess costs a few seconds, so the verdict is
+    # remembered for the exact pair of builds it was reached for.
+    receipt = os.path.join(script_path, "tmp", "torchvision-ok")
+    pair = f"{_installed_version('torch')}|{_installed_version('torchvision')}"
+
+    try:
+        with open(receipt, "r", encoding="utf-8") as file:
+            if file.read().strip() == pair:
+                return
+    except OSError:
+        pass
+
+    working, detail = torchvision_ops_load()
+    if working:
+        _write_receipt(receipt, pair)
+        return
+
+    print("torchvision cannot load its compiled ops (ABI mismatch with the installed PyTorch); repairing...")
+
+    stamp = _local_version("torch")
+    candidates: list[str] = []
+
+    if backend == gpu_backend.Backend.ROCM and os.name == "nt" and stamp not in (None, "cpu"):
+        index = gpu_backend.rocm_index_url()
+        paired = torchvision_for_torch(_installed_version("torch"))
+        ordered = ([paired] if paired else []) + [c for c in TORCHVISION_ROCM_CANDIDATES if c != paired]
+        # --no-deps keeps pip from touching the torch these builds are matched to.
+        candidates = [f"pip install --pre --force-reinstall --no-deps torchvision=={version}+{stamp} --index-url {index}" for version in ordered]
+    else:
+        # Every other backend installs torch and torchvision together, so the
+        # only sane repair is to redo that install from scratch.
+        candidates = [torch_install_command(backend).replace("pip install ", "pip install --force-reinstall ", 1)]
+
+    for command in candidates:
+        try:
+            run(f'"{python}" -m {command}', "Installing torchvision (ABI match)", "Couldn't install torchvision", live=True)
+        except RuntimeError:
+            continue
+
+        working, detail = torchvision_ops_load()
+        if working:
+            print(f"torchvision {_installed_version('torchvision')} loads correctly.")
+            _write_receipt(receipt, f"{_installed_version('torch')}|{_installed_version('torchvision')}")
+            startup_timer.record("repair torchvision")
+            return
+
+    raise RuntimeError(f"""torchvision is installed but its compiled extension will not load, so image ops
+(`torchvision::nms` and friends) are missing. Every torchvision build offered for
+torch {_installed_version("torch")} was tried.
+
+Pin a working pair by hand, e.g.:
+    set TORCH_VERSION=2.9.1+rocm7.13.0a20260421
+    set TORCHVISION_VERSION=0.24.0+rocm7.13.0a20260421
+then re-launch with --reinstall-torch. See AMD.md.
+{detail}""")
+
+
 def prepare_environment():
     backend = resolve_gpu_backend()
 
@@ -538,6 +691,12 @@ assert cuda or xpu or mps
 {detail}""")
                 raise RuntimeError("PyTorch is not able to access any compute device (GPU)")
             startup_timer.record("torch GPU test")
+
+    if not args.skip_torch_cuda_test:
+        # Before anything downstream (extension installers, the requirements
+        # step) gets a chance to import a torchvision that cannot load.
+        repair_torchvision(backend)
+        startup_timer.record("torchvision check")
 
     if not is_installed("packaging"):
         run_pip(f"install {packaging_package}", "packaging")
@@ -645,6 +804,10 @@ assert cuda or xpu or mps
         startup_timer.record("enforce requirements")
 
     verify_torch_build(backend)
+
+    if not args.skip_torch_cuda_test:
+        repair_torchvision(backend)
+        startup_timer.record("torchvision check")
 
     if "--exit" in sys.argv:
         print("Exiting because of --exit argument")

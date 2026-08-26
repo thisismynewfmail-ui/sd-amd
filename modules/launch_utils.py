@@ -391,6 +391,49 @@ HIP SDK 7.x is not supported by ZLUDA.""")
     startup_timer.record("install zluda")
 
 
+def _local_version(package: str) -> str | None:
+    """Local version label of an installed package: `2.9.1+rocm7.13` -> `rocm7.13`."""
+
+    try:
+        version = importlib.metadata.version(package)
+    except Exception:
+        return None
+
+    # Wheels from PyPI carry no local label; those are the plain CPU builds.
+    return version.partition("+")[2] or "cpu"
+
+
+#: Local version label each backend's PyTorch build must start with.
+TORCH_BUILD_PREFIX: Final[dict[str, str]] = {
+    gpu_backend.Backend.ROCM: "rocm",
+    gpu_backend.Backend.CUDA: "cu",
+    gpu_backend.Backend.ZLUDA: "cu11",  # ZLUDA only implements the CUDA 11 API
+}
+
+
+def torch_build_mismatch(backend: str) -> str | None:
+    """
+    Explain why the installed PyTorch cannot drive `backend`, or return None.
+
+    Presence is not enough: `pip install -r requirements.txt` happily installs
+    the CPU wheels from PyPI (directly, and via facexlib's torchvision), which
+    otherwise look like a complete install and then fail the GPU test.
+    """
+
+    prefix = TORCH_BUILD_PREFIX.get(backend)
+    if prefix is None:  # cpu / directml run on any build
+        return None
+
+    for package in ("torch", "torchvision"):
+        build = _local_version(package)
+        if build is None:
+            return f"{package} is not installed"
+        if not build.startswith(prefix):
+            return f"{package} is a '{build}' build, but the '{backend}' backend needs '{prefix}*'"
+
+    return None
+
+
 def verify_torch_build(backend: str):
     """
     Warn when installing the requirements pulled a PyTorch build that does not
@@ -398,27 +441,14 @@ def verify_torch_build(backend: str):
     otherwise very hard to diagnose.
     """
 
-    expected = {
-        gpu_backend.Backend.ROCM: "rocm",
-        gpu_backend.Backend.ZLUDA: "cu",
-        gpu_backend.Backend.CUDA: "cu",
-    }.get(backend)
-
-    if expected is None:
-        return
-
-    try:
-        installed = importlib.metadata.version("torch")
-    except Exception:
-        return
-
-    local = installed.partition("+")[2]
-    if local.startswith(expected):
+    mismatch = torch_build_mismatch(backend)
+    if mismatch is None:
         return
 
     print(f"""
-Warning: the '{backend}' backend expects a '{expected}*' build of PyTorch, but '{installed}' is installed.
-Something (usually an extension's install.py) replaced it. Re-run with --reinstall-torch to fix.
+Warning: {mismatch}.
+Something (an extension's install.py, or `pip install -r requirements.txt`) replaced it.
+Re-run with --reinstall-torch to fix.
 """)
 
 
@@ -454,7 +484,11 @@ def prepare_environment():
     if backend in gpu_backend.Backend.AMD:
         print(f"AMD GPU: {', '.join(gpu_backend.amd_gpu_names()) or 'unknown'} ({gpu_backend.amd_arch() or 'unknown arch'})")
 
-    if args.reinstall_torch or not is_installed("torch") or (backend != gpu_backend.Backend.DIRECTML and not is_installed("torchvision")):
+    mismatch = torch_build_mismatch(backend)
+    if mismatch is not None:
+        print(f"Replacing PyTorch: {mismatch}")
+
+    if args.reinstall_torch or mismatch is not None or not is_installed("torch") or (backend != gpu_backend.Backend.DIRECTML and not is_installed("torchvision")):
         # TODO: Yeet Nunchaku...
         if args.nunchaku and backend == gpu_backend.Backend.CUDA:
             torch_command = os.environ.get("TORCH_COMMAND", f"pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 --extra-index-url {torch_index_url}")
@@ -490,6 +524,8 @@ assert cuda or xpu or mps
                     detail = err.decode("utf-8", "ignore") if isinstance(err, bytes) else err
                     family = gpu_backend.therock_family(gpu_backend.amd_arch())
                     raise RuntimeError(f"""PyTorch (ROCm) cannot see your Radeon GPU.
+  * installed build: torch {_local_version("torch")}, torchvision {_local_version("torchvision")}
+    (a 'cpu' build here means something reinstalled PyTorch from PyPI; use --reinstall-torch)
   * make sure the AMD Adrenalin driver is up to date
   * confirm your GPU belongs to the {family!r} wheel family
   * or fall back to ZLUDA with --gpu-backend zluda

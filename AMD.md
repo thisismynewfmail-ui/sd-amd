@@ -32,6 +32,41 @@ wheels. You do **not** need the HIP SDK unless you are using the ZLUDA fallback.
 
 ---
 
+## Without the `.bat` launcher (conda / venv)
+
+`webui-user-amd.bat` only sets `COMMANDLINE_ARGS` and calls `webui.bat`, which
+manages a `venv` for you. If you would rather bring your own environment,
+activate it and run `launch.py` directly:
+
+```bash
+conda create -n imgen python=3.13
+conda activate imgen
+python launch.py --gpu-backend rocm --pin-shared-memory
+```
+
+**Do not `pip install -r requirements.txt` first.** `requirements.txt` lists
+`torch` unpinned, so pip resolves it from PyPI — and the PyPI Windows wheels are
+**CPU-only**. (`facexlib` pulls in a CPU `torchvision` the same way.) The result
+looks like a complete install but has no GPU support:
+
+```
+RuntimeError: PyTorch (ROCm) cannot see your Radeon GPU.
+```
+
+`launch.py` installs the correct PyTorch build itself, before the requirements,
+and it inspects the *build* rather than just checking that torch is importable.
+So if you already have CPU wheels in your environment, just run `launch.py` —
+it detects the mismatch and replaces them:
+
+```
+Replacing PyTorch: torch is a 'cpu' build, but the 'rocm' backend needs 'rocm*'
+```
+
+The same check runs after the requirements step, so an extension that reinstalls
+PyTorch behind your back gets reported instead of silently disabling your GPU.
+
+---
+
 ## The backends
 
 `--gpu-backend` selects one explicitly; the default (`auto`) picks the first
@@ -185,8 +220,8 @@ Usually a HIP SDK version mismatch (7.x is not supported), or a card whose
 `rocBLAS` libraries are missing from the SDK.
 
 **The warning about a mismatched PyTorch build**
-An extension's `install.py` replaced PyTorch with a CUDA build. Relaunch with
-`--reinstall-torch`.
+Something replaced PyTorch — usually an extension's `install.py`, or a manual
+`pip install -r requirements.txt`. Relaunch with `--reinstall-torch`.
 
 **Out of memory during hires-fix**
 Drop `--use-pytorch-cross-attention` if you added it, add `--reserve-vram 1.0`,

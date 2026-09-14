@@ -274,6 +274,13 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - one of `cuda`, `rocm`, `zluda`, `directml`, `cpu`
     - see **[AMD.md](AMD.md)** for the AMD ones
 
+- `--multi-gpu`: Which GPUs to spread components over
+    - `auto` *(default)*: put the text encoder and VAE on a second GPU, leaving
+      the diffusion model a card to itself
+    - `off`: keep everything on one GPU
+    - a device list such as `0,1`
+    - `--text-enc-device` / `--vae-device` override the automatic choice
+
 - `--port`: Specify a server port to use
     - defaults to `7860`
 - `--api`: Enable [API](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/API) access

@@ -217,6 +217,64 @@ weights in a compact format and casting them per-layer as they are used:
 
 ---
 
+## More than one GPU
+
+Extra GPUs are detected and used automatically — nothing to configure. At
+startup you will see what each one was given:
+
+```
+Multi-GPU: spreading components over 2 devices
+  cuda:0  AMD Radeon RX 6800  16368 MB  gfx1030  -- diffusion model
+  cuda:1  AMD Radeon RX 6800  16368 MB  gfx1030  -- text encoder, VAE
+```
+
+**What this buys you.** The diffusion model gets a card to itself. On one 16 GB
+card a modern text encoder (6.5 GB for Qwen3-VL) has to be loaded, used, and
+then evicted to make room for the diffusion model, which *still* ends up
+spilling a couple of gigabytes into system RAM and streaming them back every
+step. Moving the text encoder and the VAE to the second card removes both the
+eviction and the spill, which is worth far more than the one conditioning
+tensor that now crosses PCIe per generation.
+
+**What it does not buy you.** One image is not generated twice as fast. A
+diffusion step is sequential, so a second GPU cannot help with the step itself —
+it helps by giving the model room. Two cards do not halve the time for a single
+image, and this is not batch-parallel: a batch of four still runs on the
+diffusion model's card.
+
+With three or more GPUs the text encoder and the VAE get one each.
+
+### Which GPUs get used
+
+A second GPU is only used automatically when it can be trusted to behave like
+the first:
+
+* **Same architecture.** Precision support, the attention backend, the MIOpen
+  decision and the INT8 fallback are all settled once, from the primary card. A
+  `gfx1100` next to a `gfx1030` does not necessarily share them, so it is left
+  out and says so.
+* **At least 4 GB.** Below that it is an integrated or display-only adapter, and
+  handing it a text encoder costs more than it saves.
+
+Either rule can be overruled — the checks decide what happens *automatically*,
+not what is possible:
+
+```bat
+:: use a card automatic placement skipped
+set COMMANDLINE_ARGS=--vae-device cuda:1
+
+:: spread over exactly these devices, compatibility rules waived
+set COMMANDLINE_ARGS=--multi-gpu 0,1
+
+:: keep everything on one card
+set COMMANDLINE_ARGS=--multi-gpu off
+```
+
+`--text-enc-device`, `--vae-device`, `--cpu-text-enc` and `--cpu-vae` always win
+over automatic placement. `--device-id` still pins the whole run to one GPU.
+
+---
+
 ## Flags that do nothing on AMD
 
 These depend on CUDA-only libraries. Passing them prints a message and

@@ -30,7 +30,7 @@ import weakref
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import psutil
 import torch
@@ -1003,18 +1003,254 @@ def inference_cast(weight_dtype: torch.dtype, inference_device: torch.device, su
     return torch.float32
 
 
+# region Multi-GPU
+
+
+class GPU(NamedTuple):
+    index: int
+    name: str
+    total_memory: int
+    #: Kernel-level identity (``gfx1030``, ``sm_86``). Automatic placement only
+    #: spans GPUs whose tags match: dtype support, the attention backend, the
+    #: MIOpen decision and the INT8 fallback are all settled once, from the
+    #: primary device, and a card of another architecture may not share them.
+    arch: str
+
+
+#: Below this a device is an integrated or display-only adapter. Handing a
+#: multi-gigabyte text encoder to one costs more than leaving it where it was.
+MIN_SECONDARY_VRAM: int = 4 * 1024 * 1024 * 1024
+
+MULTI_GPU_OFF = ("off", "none", "no", "false", "disable", "disabled")
+MULTI_GPU_AUTO = ("auto", "on", "yes", "true", "")
+
+
+def _gpu_arch_tag(index: int) -> str:
+    """
+    Architecture tag for one device, never a guess.
+
+    `amd_arch` falls back to probing the HIP runtime, which answers for device 0
+    whatever it is asked about -- harmless where it is used to describe "the
+    GPU", but here it would make a second card of a different architecture look
+    identical to the first and get pooled with it. So an unanswerable device
+    gets a tag that matches nothing, and is left out of automatic placement.
+    """
+
+    device = torch.device("cuda", index)
+    try:
+        properties = torch.cuda.get_device_properties(device)
+        if is_amd():
+            arch = getattr(properties, "gcnArchName", "")
+            return arch.split(":")[0] if arch else f"unknown-cuda:{index}"
+        return "sm_{}{}".format(*torch.cuda.get_device_capability(device))
+    except Exception:
+        return f"unknown-cuda:{index}"
+
+
+@lru_cache
+def gpu_inventory() -> tuple[GPU, ...]:
+    """Every GPU torch can see, in device order."""
+
+    if cpu_state is not CPUState.GPU or directml_enabled or is_intel_xpu():
+        return ()
+
+    try:
+        count = torch.cuda.device_count()
+    except Exception:
+        return ()
+
+    found = []
+    for index in range(count):
+        try:
+            # `get_device_properties` reads the device without creating a
+            # context on it, so merely taking inventory costs no VRAM.
+            properties = torch.cuda.get_device_properties(index)
+            found.append(GPU(index, properties.name, properties.total_memory, _gpu_arch_tag(index)))
+        except Exception as e:
+            logger.warning(f"Could not query cuda:{index}, ignoring it: {e}")
+
+    return tuple(found)
+
+
+def _primary_index() -> int:
+    device = get_torch_device()
+    return device.index if device.index is not None else 0
+
+
+@lru_cache
+def multi_gpu_devices() -> tuple[GPU, ...]:
+    """
+    GPUs automatic placement may spread work over, primary first.
+
+    Empty when there is nothing to spread over, or when the user said not to --
+    in which case every placement decision below falls back to its
+    single-GPU behaviour unchanged.
+    """
+
+    inventory = gpu_inventory()
+    if len(inventory) < 2:
+        return ()
+
+    by_index = {gpu.index: gpu for gpu in inventory}
+    primary_index = _primary_index()
+    primary = by_index.get(primary_index)
+    if primary is None:
+        return ()
+
+    mode = (getattr(args, "multi_gpu", "auto") or "auto").strip().lower()
+
+    if mode in MULTI_GPU_OFF:
+        return ()
+
+    if mode not in MULTI_GPU_AUTO:
+        try:
+            wanted = [int(part) for part in mode.replace(" ", "").split(",") if part]
+        except ValueError:
+            logger.warning(f'Ignoring --multi-gpu "{mode}": expected "auto", "off", or a device list like "0,1"')
+            return ()
+
+        unknown = [index for index in wanted if index not in by_index]
+        if unknown:
+            logger.warning(f"--multi-gpu names {unknown}, which torch cannot see; ignoring those")
+
+        # An explicit list is the user overruling the compatibility rule below,
+        # so it is taken as given -- but the primary is always in it, and the
+        # order the user gave decides which secondary gets what.
+        chosen = [primary]
+        for index in wanted:
+            gpu = by_index.get(index)
+            if gpu is not None and gpu not in chosen:
+                chosen.append(gpu)
+
+        return tuple(chosen) if len(chosen) > 1 else ()
+
+    usable = [primary]
+    for gpu in inventory:
+        if gpu.index == primary.index:
+            continue
+        if gpu.arch != primary.arch:
+            if gpu.arch.startswith("unknown"):
+                reason = "its architecture could not be read, so it cannot be assumed to match"
+            else:
+                reason = f"{gpu.arch} differs from cuda:{primary.index}'s {primary.arch}"
+            logger.info(f"Not placing work on cuda:{gpu.index} ({gpu.name}): {reason} (--vae-device cuda:{gpu.index} to use it anyway)")
+            continue
+        if gpu.total_memory < MIN_SECONDARY_VRAM:
+            logger.info(f"Not placing work on cuda:{gpu.index} ({gpu.name}): {gpu.total_memory // (1024 * 1024)} MB is too little to be worth it")
+            continue
+        usable.append(gpu)
+
+    return tuple(usable) if len(usable) > 1 else ()
+
+
+@lru_cache
+def auto_placement() -> dict[str, torch.device]:
+    """
+    Which GPU each component should run on. Empty unless there are several.
+
+    The diffusion model keeps the primary GPU to itself. Everything else is the
+    competition it would otherwise have to share with: the text encoder is often
+    the single largest component (6 GB is ordinary for a modern one) and runs
+    once per generation, and the VAE runs once at the end -- so on one card both
+    of them force the diffusion model to spill into system RAM, and are then
+    evicted to make room again. Moving them to the second GPU lets the diffusion
+    model stay resident, which is worth far more than it costs to shuttle a
+    conditioning tensor across PCIe once per generation.
+    """
+
+    devices = multi_gpu_devices()
+    if len(devices) < 2:
+        return {}
+
+    secondaries = devices[1:]
+    return {
+        "text encoder": torch.device("cuda", secondaries[0].index),
+        "VAE": torch.device("cuda", secondaries[min(1, len(secondaries) - 1)].index),
+    }
+
+
+@lru_cache
+def active_devices() -> tuple[torch.device, ...]:
+    """
+    Every GPU this process puts work on, primary first.
+
+    Called from the cleanup paths, so it never raises: losing a device from
+    this list costs some cached VRAM, while throwing would replace whatever
+    error is already being handled.
+    """
+
+    primary = get_torch_device()
+    if primary.type != "cuda":
+        return (primary,)
+
+    devices = [primary]
+    try:
+        for device in auto_placement().values():
+            if device not in devices:
+                devices.append(device)
+
+        # Explicit --text-enc-device/--vae-device can name a card auto
+        # placement never chose, and those need cleaning up just the same.
+        for chosen in (text_encoder_device(), vae_device()):
+            if chosen.type == "cuda" and chosen not in devices:
+                devices.append(chosen)
+    except Exception as e:
+        logger.debug(f"Could not enumerate the devices in use: {e}")
+
+    return tuple(devices)
+
+
+def log_gpu_inventory():
+    """Report what is present and what each device was given."""
+
+    inventory = gpu_inventory()
+    if len(inventory) < 2:
+        return
+
+    devices = multi_gpu_devices()
+    if not devices:
+        mode = (getattr(args, "multi_gpu", "auto") or "auto").strip().lower()
+        why = "disabled by --multi-gpu" if mode in MULTI_GPU_OFF else "nothing compatible to spread onto"
+        logger.info(f"Multi-GPU: {len(inventory)} devices present, all work on cuda:{_primary_index()} ({why})")
+        return
+
+    roles: dict[int, list[str]] = {_primary_index(): ["diffusion model"]}
+    for role, device in auto_placement().items():
+        roles.setdefault(device.index, []).append(role)
+
+    logger.info(f"Multi-GPU: spreading components over {len(devices)} devices")
+    for gpu in inventory:
+        assignment = ", ".join(roles.get(gpu.index, [])) or "unused"
+        logger.info(f"  cuda:{gpu.index}  {gpu.name}  {gpu.total_memory // (1024 * 1024)} MB  {gpu.arch or 'unknown'}  -- {assignment}")
+
+
+# endregion
+
+
 def text_encoder_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only else cpu
+    if args.gpu_only:
+        # Offloading to the primary would defeat the placement: the weights
+        # would cross PCIe twice per generation and land back where the
+        # diffusion model needs the room.
+        return auto_placement().get("text encoder", get_torch_device())
+    return cpu
 
 
 def text_encoder_device() -> torch.device:
     if args.text_enc_device is not None:
         return torch.device(args.text_enc_device)
     if args.gpu_only:
-        return get_torch_device()
+        return auto_placement().get("text encoder", get_torch_device())
     if args.cpu_text_enc:
         return cpu
-    elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM):
+
+    placed = auto_placement().get("text encoder")
+    if placed is not None:
+        # Beats both branches below: the primary is spoken for, and a spare GPU
+        # beats the CPU the low-VRAM branch would otherwise settle for.
+        return placed
+
+    if vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM):
         if should_use_fp16(prioritize_performance=False):
             return get_torch_device()
         else:
@@ -1060,11 +1296,15 @@ def intermediate_device() -> torch.device:
 def vae_device() -> torch.device:
     if args.vae_device is not None:
         return torch.device(args.vae_device)
-    return cpu if args.cpu_vae else get_torch_device()
+    if args.cpu_vae:
+        return cpu
+    return auto_placement().get("VAE", get_torch_device())
 
 
 def vae_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only else cpu
+    if args.gpu_only:
+        return auto_placement().get("VAE", get_torch_device())
+    return cpu
 
 
 def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:
@@ -1517,8 +1757,12 @@ def soft_empty_cache(force=False):
         torch.xpu.empty_cache()
     elif torch.cuda.is_available():
         try:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            # `empty_cache` only releases the *current* device's cached blocks,
+            # so a second GPU would keep its allocator pool forever.
+            for device in active_devices():
+                with torch.cuda.device(device):
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
             if not is_zluda():
                 # CUDA IPC is not implemented by ZLUDA, and is a no-op on ROCm.
                 torch.cuda.ipc_collect()
@@ -1549,7 +1793,11 @@ def unload_model(model: "ModelPatcher") -> bool:
 
 
 def unload_all_models():
-    free_memory(1e30, get_torch_device())
+    # Every GPU holding models, not just the primary: a text encoder placed on
+    # a second card would otherwise stay resident through "unload all", and the
+    # VRAM it holds would never come back.
+    for device in active_devices():
+        free_memory(1e30, device)
 
 
 # region Streams

@@ -123,6 +123,8 @@ def initialize_forge():
 
     from backend import memory_management
 
+    memory_management.log_gpu_inventory()
+
     startup_timer.record("memory_management")
 
     import torchvision  # noqa: F401

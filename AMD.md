@@ -244,6 +244,38 @@ diffusion model's card.
 
 With three or more GPUs the text encoder and the VAE get one each.
 
+**They stay there.** A component that fits comfortably on its card is kept
+resident between generations rather than being pushed back to system RAM and
+re-uploaded each time — which for a 6.5 GB text encoder is about twenty seconds
+of every generation:
+
+```
+Keeping the text encoder resident on cuda:1 (6528 MB)
+Keeping the VAE resident on cuda:1 (484 MB)
+```
+
+Components sharing a card are weighed together, against 60% of it, so the rest
+stays free for activations and the desktop. Anything that does not fit keeps
+system RAM as its backstop and says so.
+
+### When a model still spills into RAM
+
+The diffusion model's card is shared with its own activations, and those are
+reserved before any weights are placed. When the weights do not fit in what is
+left, the log says so in full rather than leaving you to infer it from a single
+"usable" figure:
+
+```
+cuda:0 budget for KModel: 16368 MB card, 15900 MB free, 4075 MB held back for
+activations and overhead -> 11825 MB for weights, 2305 MB spilling to RAM
+(--reserve-vram lowers the hold-back)
+```
+
+A second GPU cannot help here: the overflow has to live somewhere the whole
+model can rest, and a card already hosting the text encoder cannot also hold a
+14 GB diffusion model. What closes the gap is a smaller hold-back
+(`--reserve-vram 0.5`), a smaller image, or a more compact checkpoint.
+
 ### Which GPUs get used
 
 A second GPU is only used automatically when it can be trusted to behave like

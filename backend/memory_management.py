@@ -697,7 +697,10 @@ def minimum_inference_memory() -> float:
 
 
 def free_memory(memory_required: float, device: torch.device, keep_loaded: list["LoadedModel"] = []):
-    if torch.cuda.is_available():
+    # Drain the device being freed, not whichever one happens to be current.
+    if is_device_cuda(device) and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    elif torch.cuda.is_available():
         torch.cuda.synchronize()
     elif torch.xpu.is_available():
         torch.xpu.synchronize()
@@ -822,7 +825,11 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+        # Casting and quantising the weights goes through the same kernels the
+        # forward pass does, so the load has to run with the model's own GPU
+        # current for anything placed off the default device.
+        with device_context(torch_dev):
+            loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
         current_loaded_models.insert(0, loaded_model)
 
     if (moving_time := time.perf_counter() - execution_start_time) > 0.1:
@@ -1198,6 +1205,28 @@ def active_devices() -> tuple[torch.device, ...]:
         logger.debug(f"Could not enumerate the devices in use: {e}")
 
     return tuple(devices)
+
+
+def device_context(device: torch.device):
+    """
+    Make `device` the current CUDA device for the duration of a model's forward.
+
+    PyTorch's own operators carry a device guard and do not need this, but code
+    reached through DLPack does: comfy-kitchen's HIP and CUDA kernels export
+    their tensors with `__dlpack__`, which refuses outright when the exporting
+    tensor is not on the process's current device --
+
+        BufferError: Can't export tensors on a different CUDA device index.
+                     Expected: 1. Current device: 0.
+
+    -- so any model living anywhere but the default device has to be run inside
+    this. (That applies to `--text-enc-device cuda:1` just as much as it does to
+    automatic placement; it was simply never reachable before.)
+    """
+
+    if device is not None and getattr(device, "type", None) == "cuda":
+        return torch.cuda.device(device)
+    return nullcontext()
 
 
 def log_gpu_inventory():
@@ -1818,9 +1847,12 @@ def current_stream(device: torch.device):
     if device is None:
         return None
     if is_device_cuda(device):
-        return torch.cuda.current_stream()
+        # The argument matters: without it this returns the *current* device's
+        # stream, so the offload stream for a second GPU would synchronise
+        # against the wrong queue and read weights still in flight.
+        return torch.cuda.current_stream(device)
     elif is_device_xpu(device):
-        return torch.xpu.current_stream()
+        return torch.xpu.current_stream(device)
     else:
         return None
 

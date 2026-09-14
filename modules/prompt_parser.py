@@ -6,6 +6,8 @@ from collections import namedtuple
 import lark
 import torch
 
+from backend import memory_management
+
 # a prompt like this: "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75] [in foreground::0.6] [:in background:0.25] [shoddy:masterful:0.5]"
 # will be represented with prompt_schedule like this (assuming steps=100):
 # [25,  'fantasy landscape with a mountain and an oak in foreground shoddy']
@@ -185,7 +187,9 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps: 
             continue
 
         texts = SdConditioning([x[1] for x in prompt_schedule], copy_from=prompts)
-        conds: torch.Tensor = model.get_learned_conditioning(texts)
+        # The text encoder may live on a GPU that is not the current one.
+        with memory_management.device_context(memory_management.text_encoder_device()):
+            conds: torch.Tensor = model.get_learned_conditioning(texts)
 
         cond_schedule = []
         for i, (end_at_step, _) in enumerate(prompt_schedule):

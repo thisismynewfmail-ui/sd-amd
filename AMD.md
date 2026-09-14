@@ -273,6 +273,19 @@ set COMMANDLINE_ARGS=--multi-gpu off
 `--text-enc-device`, `--vae-device`, `--cpu-text-enc` and `--cpu-vae` always win
 over automatic placement. `--device-id` still pins the whole run to one GPU.
 
+### If you see "Can't export tensors on a different CUDA device index"
+
+```
+BufferError: Can't export tensors on a different CUDA device index. Expected: 1. Current device: 0.
+```
+
+A model was run while a different GPU was the process's current device. The
+quantisation kernels hand tensors over through DLPack, which refuses when the
+two disagree — so anything living off the default device has to run inside a
+device context, and the text encoder, the VAE and model loading all do. If this
+appears from somewhere else, that path is missing one; `--multi-gpu off` is the
+workaround until it is fixed.
+
 ---
 
 ## Flags that do nothing on AMD

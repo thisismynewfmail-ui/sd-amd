@@ -1,5 +1,6 @@
 # reference: https://github.com/comfyanonymous/ComfyUI/blob/v0.3.64/comfy/sd.py#L273
 
+import functools
 import itertools
 import math
 
@@ -7,6 +8,23 @@ import torch
 
 from backend import memory_management
 from backend.patcher.base import ModelPatcher
+
+
+def on_vae_device(method):
+    """
+    Run a VAE entry point with the VAE's own GPU current.
+
+    Automatic placement (and --vae-device) can put the VAE on a device that is
+    not the default one, and the quantisation kernels reached from here export
+    tensors through DLPack, which insists on the two matching.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with memory_management.device_context(self.device):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @torch.inference_mode()
@@ -199,6 +217,7 @@ class VAE:
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
         return tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
 
+    @on_vae_device
     def decode(self, samples_in: torch.Tensor):
         if memory_management.VAE_ALWAYS_TILED:
             return self.decode_tiled(samples_in).to(self.output_device)
@@ -232,6 +251,7 @@ class VAE:
         pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
         return pixel_samples
 
+    @on_vae_device
     def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16):
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
@@ -250,6 +270,7 @@ class VAE:
 
         return output.movedim(1, -1)
 
+    @on_vae_device
     def encode(self, pixel_samples: torch.Tensor):
         if memory_management.VAE_ALWAYS_TILED:
             return self.encode_tiled(pixel_samples)
@@ -284,6 +305,7 @@ class VAE:
 
         return samples
 
+    @on_vae_device
     def encode_tiled(self, pixel_samples: torch.Tensor, tile_x: int = 512, tile_y: int = 512, overlap: int = 64):
         pixel_samples = pixel_samples.movedim(-1, 1)
         if self.is_wan:

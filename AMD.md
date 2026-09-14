@@ -227,6 +227,9 @@ continues, rather than failing the install:
 
 INT8 checkpoints load and run, but without an INT8 speedup — see above.
 
+MIOpen is disabled by default (`ENABLE_MIOPEN=1` re-enables it); see
+Troubleshooting for why.
+
 ---
 
 ## Troubleshooting
@@ -291,6 +294,29 @@ NaN in the output: the diffusion model produced NaN, ... Worth trying:
   * --bf16-unet          run the model in its native bf16 (slower, numerically faithful)
   ...
 ```
+
+**"The GPU stopped responding and its context was lost"**
+A kernel faulted or the driver reset the card. Nothing works afterwards until
+the Web UI is restarted — everything printed after that message is fallout, not
+new information.
+
+Two causes on this hardware:
+
+* **MIOpen convolutions.** MIOpen benchmarks candidate kernels at runtime, and
+  on `gfx1030` a candidate can take the GPU down with it, usually during VAE
+  decode and usually preceded by `CK grouped conv library not found`. MIOpen is
+  therefore off by default here and PyTorch's own convolutions are used instead
+  — sometimes slower, but they come back. `ENABLE_MIOPEN=1` turns it back on.
+* **TDR** (Windows' driver timeout). Windows resets a GPU that spends more than
+  two seconds inside one kernel. Generating at a lower resolution or with tiled
+  VAE decoding keeps individual kernels short; failing that, raise the timeout:
+
+  ```
+  reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrDelay /t REG_DWORD /d 20 /f
+  ```
+
+  Reboot afterwards. This is a global Windows setting — it delays the safety net
+  that recovers a genuinely hung GPU, so raise it, don't disable it.
 
 **Out of memory during hires-fix**
 Drop `--use-pytorch-cross-attention` if you added it, add `--reserve-vram 1.0`,

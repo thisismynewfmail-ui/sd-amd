@@ -31,6 +31,7 @@ parser.add_argument("--disable-gpu-warning", action="store_true", help="Disable 
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')
+parser.add_argument("--multi-gpu", type=str, default="auto", metavar="MODE", help='Spread components over several GPUs: "auto" (default), "off", or a device list like "0,1"')
 
 fp_group = parser.add_mutually_exclusive_group()
 fp_group.add_argument("--force-fp32", action="store_true", help="Force fp32")

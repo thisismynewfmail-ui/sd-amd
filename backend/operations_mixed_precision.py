@@ -40,6 +40,57 @@ def _quantized_apply(module: torch.nn.Module, fn, recurse=True):
     return module
 
 
+#: Set once a checkpoint has been reported as loading unquantised, so the warning
+#: does not repeat for every one of several hundred layers.
+_quant_metadata_warned: bool = False
+
+
+def decode_quant_config(blob: "torch.Tensor", layer_name: str) -> dict | None:
+    """
+    Read a `comfy_quant` blob: JSON, written as UTF-8 bytes in a uint8 tensor.
+
+    `json.loads` sniffs the encoding of a bytes object, and its rule is that two
+    leading zero bytes mean UTF-32. A blob that happens to look that way -- code
+    points stored wider than a byte, say -- is decoded as UTF-32 and dies with
+
+        UnicodeDecodeError: 'utf-32-be' codec can't decode bytes ... truncated data
+
+    The writer uses UTF-8, so the reader says UTF-8 rather than guessing, and
+    only falls back to the sniffer for a checkpoint that really did use
+    something else.
+    """
+
+    global _quant_metadata_warned
+
+    try:
+        if blob.dtype != torch.uint8:
+            # Code points held in something wider: narrow them first, rather
+            # than reinterpreting the padding bytes as text -- and before any
+            # .numpy(), which does not accept every dtype a checkpoint may use.
+            blob = blob.to(torch.uint8)
+        raw = blob.numpy().tobytes()
+    except Exception as e:
+        logger.warning(f"Could not read the quantisation metadata of layer {layer_name}: {e}")
+        return None
+
+    for decode in (lambda b: json.loads(b.decode("utf-8")), json.loads):
+        try:
+            return decode(raw)
+        except Exception:
+            continue
+
+    if not _quant_metadata_warned:
+        _quant_metadata_warned = True
+        logger.warning(
+            f"Could not decode the quantisation metadata of layer {layer_name} (first bytes: {raw[:24]!r}).\n"
+            "This checkpoint will load unquantised instead -- at roughly twice the size, which on a\n"
+            "card that would otherwise have fitted it means the difference between running and\n"
+            "streaming most of the model over PCIe every step."
+        )
+
+    return None
+
+
 def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict[str, torch.Tensor], prefix: str, local_metadata, strict, missing_keys, unexpected_keys, error_msgs, load_extra_params=False):
     device = module.factory_kwargs["device"]
     compute_dtype = module.factory_kwargs["dtype"]
@@ -64,9 +115,17 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
 
     layer_conf = state_dict.pop(f"{prefix}comfy_quant", None)
     if layer_conf is not None:
-        layer_conf = json.loads(layer_conf.numpy().tobytes())
+        layer_conf = decode_quant_config(layer_conf, layer_name)
 
     if layer_conf is None:
+        global _quant_metadata_warned
+        if not _quant_metadata_warned and f"{prefix}weight_scale" in state_dict:
+            # The layer carries quantisation scales but no config naming the
+            # format, so they go unused and the weights load at full width.
+            # Silently doubling a checkpoint's size is the kind of thing that
+            # turns a model that fits into one that streams over PCIe.
+            _quant_metadata_warned = True
+            logger.warning(f"Layer {layer_name} has quantisation scales but no readable format; this checkpoint is loading unquantised, at roughly twice its size")
         module.weight = torch.nn.Parameter(weight.to(device=device, dtype=compute_dtype), requires_grad=False)
     else:
         module.quant_format = layer_conf.get("format", None)
@@ -201,6 +260,9 @@ def _quantized_weight_state_dict(module: torch.nn.Module, sd: dict[str, torch.Te
 
 
 def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_precision_mm=False, disabled=[]):
+    global _quant_metadata_warned
+    _quant_metadata_warned = False  # a fresh checkpoint gets to report its own problems
+
     class MixedPrecisionOps(ForgeOperations):
         _quant_config = quant_config
         _compute_dtype = compute_dtype
@@ -296,7 +358,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 weight_key = f"{prefix}weight"
                 layer_conf = state_dict.pop(f"{prefix}comfy_quant", None)
                 if layer_conf is not None:
-                    layer_conf = json.loads(layer_conf.numpy().tobytes())
+                    layer_conf = decode_quant_config(layer_conf, prefix.rstrip("."))
 
                 quant_format = layer_conf.get("format") if layer_conf is not None else None
                 manually_loaded_keys = []

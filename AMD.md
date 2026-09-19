@@ -400,6 +400,25 @@ GPU. This is detected automatically on the first launch after the venv is built;
 if you are seeing it, delete `tmp\int-mm-*.ok` and relaunch so the check runs
 again.
 
+**"UnicodeDecodeError: 'utf-32-be' codec can't decode bytes"**, or a checkpoint
+that loads at twice its size
+A quantised checkpoint stores a small JSON blob per layer describing its format.
+`json.loads` guesses the encoding of raw bytes, and reads two leading zero bytes
+as UTF-32 — so a blob holding its characters in anything wider than a byte gets
+decoded as UTF-32 and fails. The layer then loads *unquantised*, which is easy
+to miss until the arithmetic stops adding up:
+
+```
+Diffusion Model: {storage: torch.float16, computation: torch.float16}
+cuda:0 budget for KModel: ... -> 7497 MB for weights, 16955 MB spilling to RAM
+```
+
+An fp8 checkpoint reported as `storage: torch.float16` is twice the size it
+should be, and the spill that follows streams most of the model over PCIe every
+step — which is enough on its own to trip the driver's timeout and reset the
+GPU. The metadata is now decoded as the UTF-8 it is written as, and a checkpoint
+that still cannot be read says so instead of quietly doubling.
+
 **A black image**
 The log names the sampling step the NaN first appeared on:
 

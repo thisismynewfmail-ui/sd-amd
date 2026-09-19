@@ -742,6 +742,12 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
     return unloaded_models
 
 
+def model_display_name(loaded_model: "LoadedModel") -> str:
+    """Name of the wrapped module, for logs and for a stable sort order."""
+
+    return getattr(getattr(loaded_model.model, "model", None), "__class__", type(None)).__name__
+
+
 def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, force_patch_weights: bool = False, minimum_memory_required: float = None, force_full_load: bool = False):
     execution_start_time = time.perf_counter()
     cleanup_models_gc(target=models)
@@ -789,6 +795,14 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
             model_to_unload.model.detach(unpatch_all=False)
             model_to_unload.model_finalizer.detach()
 
+    # Biggest first. Each model's share of VRAM is worked out when its turn
+    # comes, against whatever is free at that moment, so order decides who gets
+    # the room -- and `models` above is a set, which meant the order was
+    # whatever hashing produced. A large model squeezed in behind a small one
+    # spills to system RAM and then streams back every step, while the small
+    # one would have fitted in the remainder either way.
+    models_to_load.sort(key=lambda m: (-m.model_memory_required(m.device), model_display_name(m)))
+
     total_memory_required = {}
     for loaded_model in models_to_load:
         total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.model_memory_required(loaded_model.device)
@@ -821,6 +835,20 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
 
             if lowvram_model_memory == 0:
                 lowvram_model_memory = 0.1
+
+            needed = loaded_model.model_memory_required(torch_dev)
+            if needed > lowvram_model_memory:
+                # The headline "N MB usable" says nothing about where the rest
+                # of the card went, which makes a spill into system RAM look
+                # like the GPU is simply not being used.
+                MB = 1024 * 1024
+                logger.info(
+                    f"cuda:{torch_dev.index} budget for {model_display_name(loaded_model)}: "
+                    f"{get_total_memory(torch_dev) / MB:.0f} MB card, {current_free_mem / MB:.0f} MB free, "
+                    f"{minimum_memory_required / MB:.0f} MB held back for activations and overhead "
+                    f"-> {lowvram_model_memory / MB:.0f} MB for weights, {(needed - lowvram_model_memory) / MB:.0f} MB spilling to RAM "
+                    f"(--reserve-vram lowers the hold-back)"
+                )
 
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
@@ -1256,13 +1284,62 @@ def log_gpu_inventory():
 # endregion
 
 
-def text_encoder_offload_device() -> torch.device:
+#: A placed component may rest on its own GPU while it uses no more than this
+#: much of the card, leaving room for the other placed component, its
+#: activations, and the desktop.
+RESIDENT_SHARE: float = 0.6
+
+#: (device index, role) -> bytes a component is holding on that card.
+_resident_claims: dict[tuple[int, str], int] = {}
+
+
+def placed_offload_device(role: str, module: torch.nn.Module = None) -> torch.device:
+    """
+    Where a component placed on a secondary GPU should rest between uses.
+
+    Resting in system RAM means a full re-upload every generation -- about 20
+    seconds for a 6.5 GB text encoder, every time, and it is the reason a model
+    keeps reappearing in RAM after being placed on a GPU. A card that was given
+    to a component precisely because nothing else is competing for it should
+    simply keep it.
+
+    Only when the weights leave room to spare, though: with nowhere smaller to
+    spill to, a component that fills its card cannot be partially loaded, so
+    anything that large keeps system RAM as its backstop.
+    """
+
+    placed = auto_placement().get(role)
+    if placed is None:
+        return get_torch_device() if args.gpu_only else cpu
+
     if args.gpu_only:
-        # Offloading to the primary would defeat the placement: the weights
-        # would cross PCIe twice per generation and land back where the
-        # diffusion model needs the room.
-        return auto_placement().get("text encoder", get_torch_device())
-    return cpu
+        return placed
+
+    if module is None:
+        # Nothing to weigh -- callers that build their model *after* choosing a
+        # device land here, and they keep the old behaviour rather than an
+        # unchecked claim on the card.
+        return cpu
+
+    size = module_size(module)
+    budget = get_total_memory(placed) * RESIDENT_SHARE
+    # Roles share a card, so each one is weighed against what the others have
+    # already claimed on it. Keyed by role, so reloading a checkpoint replaces
+    # that role's claim instead of counting it twice.
+    committed = sum(claim for (index, claimed_role), claim in _resident_claims.items() if index == placed.index and claimed_role != role)
+
+    if size + committed > budget:
+        _resident_claims.pop((placed.index, role), None)
+        logger.info(f"Keeping the {role} on the CPU between uses: {size / (1024 * 1024):.0f} MB does not fit the {(budget - committed) / (1024 * 1024):.0f} MB left to hold permanently on cuda:{placed.index}")
+        return cpu
+
+    _resident_claims[(placed.index, role)] = size
+    logger.info(f"Keeping the {role} resident on cuda:{placed.index} ({size / (1024 * 1024):.0f} MB)")
+    return placed
+
+
+def text_encoder_offload_device(module: torch.nn.Module = None) -> torch.device:
+    return placed_offload_device("text encoder", module)
 
 
 def text_encoder_device() -> torch.device:
@@ -1330,10 +1407,8 @@ def vae_device() -> torch.device:
     return auto_placement().get("VAE", get_torch_device())
 
 
-def vae_offload_device() -> torch.device:
-    if args.gpu_only:
-        return auto_placement().get("VAE", get_torch_device())
-    return cpu
+def vae_offload_device(module: torch.nn.Module = None) -> torch.device:
+    return placed_offload_device("VAE", module)
 
 
 def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:

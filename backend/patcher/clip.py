@@ -12,11 +12,12 @@ class CLIP:
         if no_init:
             return
 
-        load_device = memory_management.text_encoder_device()
-        offload_device = memory_management.text_encoder_offload_device()
-
         self.cond_stage_model = JointTextEncoder(model_dict)
         self.tokenizer = ObjectDict(tokenizer_dict)
+
+        load_device = memory_management.text_encoder_device()
+        # Built first, so the offload choice can weigh the actual weights.
+        offload_device = memory_management.text_encoder_offload_device(self.cond_stage_model)
         self.patcher = ModelPatcher(self.cond_stage_model, load_device=load_device, offload_device=offload_device)
 
     def clone(self):

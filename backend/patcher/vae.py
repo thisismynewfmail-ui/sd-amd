@@ -173,7 +173,7 @@ class VAE:
         self.first_stage_model = model.eval()
 
         self.device = device or memory_management.vae_device()
-        offload_device = memory_management.vae_offload_device()
+        offload_device = memory_management.vae_offload_device(self.first_stage_model)
 
         self.vae_dtype = dtype or memory_management.vae_dtype()
         self.first_stage_model.to(self.vae_dtype)

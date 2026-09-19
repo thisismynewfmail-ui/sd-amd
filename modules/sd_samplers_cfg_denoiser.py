@@ -1,7 +1,7 @@
 import torch
 
 from backend.sampling.sampling_function import sampling_function
-from modules import prompt_parser, sd_samplers_common
+from modules import devices, prompt_parser, sd_samplers_common
 from modules.script_callbacks import AfterCFGCallbackParams, CFGDenoiserParams, cfg_after_cfg_callback, cfg_denoiser_callback
 from modules.shared import opts, state
 
@@ -43,6 +43,9 @@ class CFGDenoiser(torch.nn.Module):
         self.mask = None
         self.nmask = None
         self.init_latent = None
+
+        self._nonfinite_reported = False
+        """whether a NaN has already been reported for this generation"""
 
         self.steps = None
         """number of steps as specified by user in UI"""
@@ -149,6 +152,14 @@ class CFGDenoiser(torch.nn.Module):
 
         extra_model_options = kwargs.get("model_options", {})
         denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition, extra_model_options=extra_model_options)
+
+        # A NaN here is carried to the end and decoded as a black image, by which
+        # point the step it started on -- the one thing that says whether this is
+        # bad weights or an overflow part-way through -- is gone. One reduction
+        # over the latent per step, against a step that takes seconds.
+        if not self._nonfinite_reported and not torch.isfinite(denoised).all():
+            self._nonfinite_reported = True
+            devices.report_nonfinite_denoised(self.step, self.total_steps)
 
         if self.mask is not None:
             blended_latent = denoised * self.nmask + self.init_latent * self.mask

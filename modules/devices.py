@@ -59,6 +59,35 @@ class NansException(Exception):
     pass
 
 
+def report_nonfinite_denoised(step: int, total_steps: int):
+    """
+    Explain a sampling step whose output is not finite, and what to do about it.
+
+    Left alone this surfaces as a black image and nothing else: the NaN is
+    carried through the remaining steps, the VAE decodes it to NaN, and the
+    pipeline turns that into zeros. Which step it first appears on separates two
+    quite different faults, so it is worth saying.
+    """
+
+    when = f"step {step} of {total_steps}"
+    lines = [f"The diffusion model produced NaN at sampling {when}; the image cannot recover from here."]
+
+    if step == 0:
+        lines.append("That is the very first step, so nothing accumulated into it -- the weights are already")
+        lines.append("wrong by the time they are used, which points at the checkpoint, its quantisation, or")
+        lines.append("the precision it is being run in rather than at the sampler.")
+    else:
+        lines.append("Earlier steps were finite, so values grew until they left the range of the compute dtype")
+        lines.append("(fp16 stops at 65504).")
+
+    lines.append("Worth trying, in this order:")
+    lines.append("  * --bf16-unet             run the model in its native bf16 -- slower, and the dependable fix")
+    lines.append("  * a GGUF or INT8 build of the same checkpoint")
+    lines.append("  * --force-upcast-attention  if it only shows up at larger sizes")
+
+    memory_management.logger.warning("\n".join(lines))
+
+
 def test_for_nans(x: torch.Tensor, *args, **kwargs):
     if torch.isnan(x).any():
         memory_management.logger.warning("Encountered NaN in Latent" + ("; Try --disable-sage" if memory_management.sage_enabled() else ""))

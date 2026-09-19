@@ -200,6 +200,18 @@ weights in a compact format and casting them per-layer as they are used:
 * **fp8 (`e4m3fn` / `e5m2`)** checkpoints — the weights stay fp8 in memory and
   are cast to fp16 for the matmul. RDNA 2 has no fp8 hardware, so `--fast-fp8`
   has no effect and is ignored.
+* **fp8** checkpoints on RDNA 2 are dequantised to fp16 and multiplied there —
+  there is no fp8 hardware, so `--fast-fp8` is ignored. That leaves the whole
+  model running in fp16, and a bf16-native model (Krea 2, Flux, Qwen-Image) can
+  exceed fp16's 65504 inside its linear layers, not only in attention. The
+  result is NaN, and a black image. If that happens, keep the compact weights
+  and do the arithmetic in bf16:
+
+  > set **Diffusion in Low Bits** to `float8-e4m3fn` (so the weights stay fp8)
+  > and launch with `--bf16-unet` (so the maths is bf16)
+
+  An INT8 build of the same checkpoint is often the better answer: its matmuls
+  accumulate in int32/fp32, so it never meets the fp16 ceiling at all.
 * **INT8** checkpoints (`...Int8.safetensors`, and INT8 Krea 2 in particular) —
   supported, and the memory saving is real, but the matmul is not accelerated
   on RDNA 2. hipBLASLt ships no INT8 GEMM kernel for `gfx103X`, and calling the
@@ -389,7 +401,19 @@ if you are seeing it, delete `tmp\int-mm-*.ok` and relaunch so the check runs
 again.
 
 **A black image**
-The log names the stage that went NaN and what to try — the diffusion model and
+The log names the sampling step the NaN first appeared on:
+
+```
+The diffusion model produced NaN at sampling step 0 of 8; the image cannot recover from here.
+That is the very first step, so nothing accumulated into it ...
+```
+
+Step 0 means the weights were already wrong when they were first used — suspect
+the checkpoint, its quantisation, or the precision it is running in. A later
+step means values grew until they overflowed, which is the fp16 ceiling and what
+`--bf16-unet` exists for.
+
+The log also names the stage that went NaN and what to try — the diffusion model and
 the VAE are separate problems with separate fixes:
 
 ```

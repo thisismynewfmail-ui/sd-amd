@@ -400,6 +400,36 @@ GPU. This is detected automatically on the first launch after the venv is built;
 if you are seeing it, delete `tmp\int-mm-*.ok` and relaunch so the check runs
 again.
 
+**A quantised checkpoint that loads at several times its size**
+A quantised checkpoint stores a small JSON blob per layer naming its format.
+When that blob cannot be read the layer loads *unquantised*, which is easy to
+miss until the arithmetic stops adding up:
+
+```
+Diffusion Model: {storage: torch.bfloat16, computation: Mixed (torch.float16)}
+cuda:0 budget for KModel: ... -> 7497 MB for weights, 41405 MB spilling to RAM
+```
+
+An fp8 checkpoint reported as `storage: torch.bfloat16` is four times the size
+it should be, and the spill that follows streams tens of gigabytes over PCIe
+every step — enough on its own to trip the driver's timeout and reset the GPU.
+
+Two things can make the blob unreadable, and both are handled. `json.loads`
+guesses the encoding of raw bytes and reads two leading zero bytes as UTF-32, so
+it is now decoded as the UTF-8 it is written as. And some checkpoints hand over
+a blob of the right length filled with zeros, in which case the format is read
+off the weights instead — an fp8 tensor next to a `weight_scale` can only be a
+tensorwise fp8 layer:
+
+```
+Reading the quantisation of blocks.0.attn.wq from its weights (float8_e4m3fn):
+the checkpoint's own metadata could not be used
+```
+
+Baking LoRAs in (`Patch LoRAs on-the-fly: False`) keeps a copy of every original
+weight, which doubles the model again. Turning it on trades some speed for that
+memory back.
+
 **A black image**
 The log names the sampling step the NaN first appeared on:
 

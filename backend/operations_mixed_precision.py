@@ -40,6 +40,96 @@ def _quantized_apply(module: torch.nn.Module, fn, recurse=True):
     return module
 
 
+#: Set once a checkpoint has been reported as loading unquantised, so the warning
+#: does not repeat for every one of several hundred layers.
+_quant_metadata_warned: bool = False
+
+#: Likewise for the one that says a layer's format was read off its weights.
+_quant_inference_warned: bool = False
+
+
+def _mark_quant_inference_warned():
+    global _quant_inference_warned
+    _quant_inference_warned = True
+
+
+def decode_quant_config(blob: "torch.Tensor", layer_name: str) -> dict | None:
+    """
+    Read a `comfy_quant` blob: JSON, written as UTF-8 bytes in a uint8 tensor.
+
+    `json.loads` sniffs the encoding of a bytes object, and its rule is that two
+    leading zero bytes mean UTF-32. A blob that happens to look that way -- code
+    points stored wider than a byte, say -- is decoded as UTF-32 and dies with
+
+        UnicodeDecodeError: 'utf-32-be' codec can't decode bytes ... truncated data
+
+    The writer uses UTF-8, so the reader says UTF-8 rather than guessing, and
+    only falls back to the sniffer for a checkpoint that really did use
+    something else.
+    """
+
+    global _quant_metadata_warned
+
+    try:
+        if blob.dtype != torch.uint8:
+            # Code points held in something wider: narrow them first, rather
+            # than reinterpreting the padding bytes as text -- and before any
+            # .numpy(), which does not accept every dtype a checkpoint may use.
+            blob = blob.to(torch.uint8)
+        raw = blob.numpy().tobytes()
+    except Exception as e:
+        logger.warning(f"Could not read the quantisation metadata of layer {layer_name}: {e}")
+        return None
+
+    for decode in (lambda b: json.loads(b.decode("utf-8")), json.loads):
+        try:
+            return decode(raw)
+        except Exception:
+            continue
+
+    if not _quant_metadata_warned:
+        _quant_metadata_warned = True
+        logger.warning(f"Could not decode the quantisation metadata of layer {layer_name} ({tuple(blob.shape)} of {blob.dtype}, first bytes: {raw[:24]!r})")
+
+    return None
+
+
+#: Weight dtype -> the layout that dtype plus a weight scale can only mean.
+_FORMAT_FROM_WEIGHT_DTYPE: dict = {
+    torch.float8_e4m3fn: "float8_e4m3fn",
+    torch.float8_e5m2: "float8_e5m2",
+    torch.int8: "int8_tensorwise",
+}
+
+
+def infer_quant_config(weight: "torch.Tensor", has_scale: bool, layer_name: str) -> dict | None:
+    """
+    Work out a layer's quantisation from the tensors themselves.
+
+    The per-layer `comfy_quant` blob is not the only evidence of how a layer was
+    quantised -- an fp8 weight sitting next to a `weight_scale` is a tensorwise
+    fp8 layer whatever the blob says, and this checkpoint's blobs arrive the
+    right length but filled with zeros. Reading the format off the data beats
+    the alternative, which is loading an fp8 checkpoint at four times the size
+    and streaming 40 GB over PCIe every step.
+    """
+
+    global _quant_metadata_warned
+
+    if not has_scale:
+        return None
+
+    quant_format = _FORMAT_FROM_WEIGHT_DTYPE.get(weight.dtype)
+    if quant_format is None:
+        return None
+
+    if not _quant_inference_warned:
+        _mark_quant_inference_warned()
+        logger.warning(f"Reading the quantisation of {layer_name} from its weights ({quant_format}): the checkpoint's own metadata could not be used")
+
+    return {"format": quant_format}
+
+
 def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict[str, torch.Tensor], prefix: str, local_metadata, strict, missing_keys, unexpected_keys, error_msgs, load_extra_params=False):
     device = module.factory_kwargs["device"]
     compute_dtype = module.factory_kwargs["dtype"]
@@ -64,7 +154,11 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
 
     layer_conf = state_dict.pop(f"{prefix}comfy_quant", None)
     if layer_conf is not None:
-        layer_conf = json.loads(layer_conf.numpy().tobytes())
+        layer_conf = decode_quant_config(layer_conf, layer_name)
+
+    if layer_conf is None:
+        # Nothing readable came with the layer, so read it off the layer.
+        layer_conf = infer_quant_config(weight, f"{prefix}weight_scale" in state_dict, layer_name)
 
     if layer_conf is None:
         module.weight = torch.nn.Parameter(weight.to(device=device, dtype=compute_dtype), requires_grad=False)
@@ -201,6 +295,10 @@ def _quantized_weight_state_dict(module: torch.nn.Module, sd: dict[str, torch.Te
 
 
 def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_precision_mm=False, disabled=[]):
+    global _quant_metadata_warned, _quant_inference_warned
+    # A fresh checkpoint gets to report its own problems.
+    _quant_metadata_warned = _quant_inference_warned = False
+
     class MixedPrecisionOps(ForgeOperations):
         _quant_config = quant_config
         _compute_dtype = compute_dtype
@@ -296,7 +394,10 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 weight_key = f"{prefix}weight"
                 layer_conf = state_dict.pop(f"{prefix}comfy_quant", None)
                 if layer_conf is not None:
-                    layer_conf = json.loads(layer_conf.numpy().tobytes())
+                    layer_conf = decode_quant_config(layer_conf, prefix.rstrip("."))
+
+                if layer_conf is None and weight_key in state_dict:
+                    layer_conf = infer_quant_config(state_dict[weight_key], f"{prefix}weight_scale" in state_dict, prefix.rstrip("."))
 
                 quant_format = layer_conf.get("format") if layer_conf is not None else None
                 manually_loaded_keys = []
